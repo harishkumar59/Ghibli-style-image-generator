@@ -335,7 +335,9 @@
             <div class="model-selection-container">
                 <label for="model-select" class="label">Model:</label>
                 <select id="model-select">
-                    <option value="stabilityai/stable-diffusion-xl-base-1.0">Stable Diffusion XL</option>
+                    <option value="flux">FLUX.1 Schnell (Primary)</option>
+                    <option value="turbo">SDXL Turbo (Fallback)</option>
+                    <option value="stable-horde">Stable Horde (Crowd GPU)</option>
                 </select>
             </div>
             
@@ -423,9 +425,6 @@
             const widthSelect = document.getElementById('width');
             const heightSelect = document.getElementById('height');
             
-            // API key is stored securely in the code
-            const API_KEY = "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";
-            
             // Theme handling
             function setTheme(isDark) {
                 document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
@@ -505,69 +504,156 @@
                     }
                 }, 500);
                 
-                // Prepare the API request
-                const apiUrl = `https://api-inference.huggingface.co/models/${modelPath}`;
-                
-                fetch(apiUrl, {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${API_KEY}`,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ 
-                        inputs: prompt,
-                        parameters: {
-                            negative_prompt: negative,
-                            width: width,
-                            height: height,
-                            guidance_scale: 7.5,
-                            num_inference_steps: 30
+                // Build final prompt with art style modifier + negative prompt hint
+                const styleModifier = 'Ghibli Studio hand-drawn anime-style illustration,';
+                const basePrompt = prompt.toLowerCase().includes('ghibli') ? prompt : `${styleModifier} ${prompt}`;
+                const finalPrompt = basePrompt + (negative ? `, avoid: ${negative}` : '');
+                const seed = Math.floor(Math.random() * 10000000);
+
+                // ── Attempt 1 & 2: Pollinations AI (FLUX → SDXL Turbo) ──────────────
+                async function fetchFromPollinations(model) {
+                    const encodedPrompt = encodeURIComponent(finalPrompt);
+                    const url = `https://image.pollinations.ai/prompt/${encodedPrompt}?model=${model}&width=${width}&height=${height}&seed=${seed}&nologo=true`;
+                    const controller = new AbortController();
+                    const timeout = setTimeout(() => controller.abort(), 60000);
+                    try {
+                        const response = await fetch(url, { signal: controller.signal });
+                        clearTimeout(timeout);
+                        if (!response.ok) throw new Error(`Pollinations ${model} responded ${response.status}`);
+                        const blob = await response.blob();
+                        if (!blob || blob.size < 1000) throw new Error('Pollinations returned empty/tiny image');
+                        return blob;
+                    } catch(e) {
+                        clearTimeout(timeout);
+                        throw e;
+                    }
+                }
+
+                // ── Attempt 3: Stable Horde (anonymous) ─────────────────────────────
+                async function fetchFromStableHorde() {
+                    const HORDE_API = 'https://stablehorde.net/api/v2';
+                    const ANON_KEY = '0000000000';
+
+                    // Submit generation job
+                    const submitRes = await fetch(`${HORDE_API}/generate/async`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'apikey': ANON_KEY,
+                            'Client-Agent': 'GhibliGenerator:1.0:anonymous'
+                        },
+                        body: JSON.stringify({
+                            prompt: finalPrompt,
+                            params: {
+                                width: Math.min(width, 768),
+                                height: Math.min(height, 768),
+                                steps: 20,
+                                cfg_scale: 7,
+                                n: 1
+                            },
+                            models: ['stable_diffusion'],
+                            r2: true,
+                            nsfw: false
+                        })
+                    });
+                    if (!submitRes.ok) throw new Error(`Horde submit failed: ${submitRes.status}`);
+                    const { id } = await submitRes.json();
+                    if (!id) throw new Error('No job ID from Stable Horde');
+
+                    // Poll for result (up to 90 seconds)
+                    const maxAttempts = 18;
+                    for (let i = 0; i < maxAttempts; i++) {
+                        await new Promise(r => setTimeout(r, 5000));
+                        const checkRes = await fetch(`${HORDE_API}/generate/check/${id}`);
+                        const checkData = await checkRes.json();
+                        if (checkData.done) {
+                            const statusRes = await fetch(`${HORDE_API}/generate/status/${id}`);
+                            const statusData = await statusRes.json();
+                            const generation = statusData.generations?.[0];
+                            if (!generation?.img) throw new Error('No image in Horde response');
+                            // img is base64 or URL
+                            if (generation.img.startsWith('http')) {
+                                const imgRes = await fetch(generation.img);
+                                return await imgRes.blob();
+                            } else {
+                                const byteStr = atob(generation.img);
+                                const arr = new Uint8Array(byteStr.length);
+                                for (let j = 0; j < byteStr.length; j++) arr[j] = byteStr.charCodeAt(j);
+                                return new Blob([arr], { type: 'image/png' });
+                            }
                         }
-                    })
-                })
-                .then(response => {
+                        if (checkData.faulted) throw new Error('Horde job faulted');
+                    }
+                    throw new Error('Stable Horde timed out');
+                }
+
+                // ── Orchestrate with fallback chain ──────────────────────────────────
+                async function generateWithFallbacks() {
+                    // Attempt 1: Pollinations FLUX
+                    try {
+                        console.log('Trying Pollinations AI (FLUX)...');
+                        showStatusToast('⚡ Trying FLUX.1 Schnell...');
+                        const blob = await fetchFromPollinations('flux');
+                        return { blob, source: 'Pollinations FLUX' };
+                    } catch(e) {
+                        console.warn('FLUX failed:', e.message);
+                    }
+
+                    // Attempt 2: Pollinations SDXL Turbo
+                    try {
+                        console.log('Trying Pollinations AI (SDXL Turbo)...');
+                        showStatusToast('🔄 Falling back to SDXL Turbo...');
+                        const blob = await fetchFromPollinations('turbo');
+                        return { blob, source: 'Pollinations SDXL Turbo' };
+                    } catch(e) {
+                        console.warn('SDXL Turbo failed:', e.message);
+                    }
+
+                    // Attempt 3: Stable Horde anonymous
+                    console.log('Trying Stable Horde (anonymous)...');
+                    showStatusToast('🐢 Using Stable Horde (may take 30–60s)...');
+                    const blob = await fetchFromStableHorde();
+                    return { blob, source: 'Stable Horde' };
+                }
+
+                generateWithFallbacks()
+                .then(({ blob, source }) => {
                     clearInterval(progressInterval);
                     progressBar.style.width = '100%';
-                    
-                    if (!response.ok) {
-                        if (response.status === 401) {
-                            throw new Error('Authentication failed: Please check your API token');
-                        } else if (response.status === 404) {
-                            throw new Error('Model not found: The specified model path is incorrect or the model is not available');
-                        } else if (response.status === 503) {
-                            throw new Error('Model is loading or service unavailable. Please try again in a moment.');
-                        } else {
-                            throw new Error(`Server error (${response.status}): ${response.statusText}`);
-                        }
-                    }
-                    return response.blob();
-                })
-                .then(blob => {
-                    if (blob.type.startsWith('image/')) {
-                        const imageUrl = URL.createObjectURL(blob);
-                        displayImage(imageUrl);
-                        addToGallery(imageUrl, prompt);
-                        showSuccess('Image generated successfully!');
-                    } else {
-                        return blob.text().then(text => {
-                            try {
-                                const errorData = JSON.parse(text);
-                                throw new Error(errorData.error || 'Unknown error occurred');
-                            } catch (e) {
-                                throw new Error('Failed to generate image: Invalid response format');
-                            }
+                    const blobUrl = URL.createObjectURL(blob);
+
+                    const img = new Image();
+                    img.onload = () => {
+                        imageContainer.innerHTML = '';
+                        img.className = 'result-image';
+                        img.alt = 'Generated Ghibli-style image';
+                        imageContainer.appendChild(img);
+                        addToGallery(blobUrl, prompt);
+
+                        // Wire download button
+                        const oldBtn = document.getElementById('download-image');
+                        const newBtn = oldBtn.cloneNode(true);
+                        oldBtn.parentNode.replaceChild(newBtn, oldBtn);
+                        newBtn.addEventListener('click', () => {
+                            const link = document.createElement('a');
+                            link.href = blobUrl;
+                            link.download = 'ghibli-generation.png';
+                            link.click();
                         });
-                    }
+
+                        showSuccess(`✅ Generated via ${source}`);
+                    };
+                    img.onerror = () => showError('Image loaded but could not be rendered.');
+                    img.src = blobUrl;
                 })
                 .catch(error => {
-                    showError(error.message || 'Error generating image. Please try again later.');
-                    console.error('Error:', error);
+                    showError('All generation attempts failed. Please check your connection and try again.');
+                    console.error('Final error:', error);
                 })
                 .finally(() => {
                     generateBtn.disabled = false;
-                    setTimeout(() => {
-                        progressBar.style.width = '0%';
-                    }, 1000);
+                    hideStatusToast();
+                    setTimeout(() => { progressBar.style.width = '0%'; }, 1000);
                 });
             }
             
@@ -578,6 +664,21 @@
                 img.alt = 'Generated Ghibli-style image';
                 img.className = 'result-image';
                 imageContainer.appendChild(img);
+            }
+
+            // Status toast for fallback notifications
+            let statusToast = null;
+            function showStatusToast(message) {
+                if (!statusToast) {
+                    statusToast = document.createElement('div');
+                    statusToast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:rgba(30,30,40,0.92);color:#fff;padding:10px 22px;border-radius:24px;font-size:0.95rem;z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,0.3);backdrop-filter:blur(8px);transition:opacity 0.3s;';
+                    document.body.appendChild(statusToast);
+                }
+                statusToast.textContent = message;
+                statusToast.style.opacity = '1';
+            }
+            function hideStatusToast() {
+                if (statusToast) { statusToast.style.opacity = '0'; }
             }
             
             function showError(message) {
@@ -591,7 +692,7 @@
                 errorMessage.textContent = '';
                 setTimeout(() => {
                     successMessage.textContent = '';
-                }, 3000);
+                }, 4000);
             }
         });
     </script>
